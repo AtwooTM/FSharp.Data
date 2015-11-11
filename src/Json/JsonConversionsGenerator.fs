@@ -8,6 +8,7 @@ open System
 open Microsoft.FSharp.Quotations
 open FSharp.Data
 open FSharp.Data.Runtime
+open FSharp.Data.Runtime.BaseTypes
 open FSharp.Data.Runtime.StructuralTypes
 open ProviderImplementation
 open ProviderImplementation.QuotationBuilder
@@ -20,7 +21,7 @@ let getConversionQuotation missingValuesStr cultureStr typ (value:Expr<JsonValue
   elif typ = typeof<int64> then <@@ JsonRuntime.ConvertInteger64(cultureStr, %value) @@>
   elif typ = typeof<decimal> then <@@ JsonRuntime.ConvertDecimal(cultureStr, %value) @@>
   elif typ = typeof<float> then <@@ JsonRuntime.ConvertFloat(cultureStr, missingValuesStr, %value) @@>
-  elif typ = typeof<bool> || typ = typeof<Bit> then <@@ JsonRuntime.ConvertBoolean(cultureStr, %value) @@>
+  elif typ = typeof<bool> || typ = typeof<Bit> then <@@ JsonRuntime.ConvertBoolean(%value) @@>
   elif typ = typeof<DateTime> then <@@ JsonRuntime.ConvertDateTime(cultureStr, %value) @@>
   elif typ = typeof<Guid> then  <@@ JsonRuntime.ConvertGuid(%value) @@>
   else failwith "getConversionQuotation: Unsupported primitive type"
@@ -30,7 +31,7 @@ type JsonConversionCallingType =
 
 /// Creates a function that takes Expr<JsonValue option> and converts it to 
 /// an expression of other type - the type is specified by `field`
-let convertJsonValue (replacer:AssemblyReplacer) missingValuesStr cultureStr canPassAllConversionCallingTypes (field:PrimitiveInferedProperty) = 
+let convertJsonValue missingValuesStr cultureStr canPassAllConversionCallingTypes (field:PrimitiveInferedProperty) = 
 
   assert (field.TypeWithMeasure = field.RuntimeType)
   assert (field.Name = "")
@@ -40,7 +41,6 @@ let convertJsonValue (replacer:AssemblyReplacer) missingValuesStr cultureStr can
     | TypeWrapper.None -> field.RuntimeType
     | TypeWrapper.Option -> typedefof<option<_>>.MakeGenericType field.RuntimeType
     | TypeWrapper.Nullable -> typedefof<Nullable<_>>.MakeGenericType field.RuntimeType
-    |> replacer.ToRuntime
 
   let wrapInLetIfNeeded (value:Expr) getBody =
     match value with
@@ -61,7 +61,7 @@ let convertJsonValue (replacer:AssemblyReplacer) missingValuesStr cultureStr can
           typeof<JsonRuntime>?GetNonOptionalValue (field.RuntimeType) (<@ (%varExpr).Path @>, convert <@ (%varExpr).JsonOpt @>, <@ (%varExpr).JsonOpt @>)
     | TypeWrapper.None, false ->
         wrapInLetIfNeeded value <| fun (varExpr:Expr<IJsonDocument>) ->
-          typeof<JsonRuntime>?GetNonOptionalValue (field.RuntimeType) (<@ (%varExpr).Path @>, convert <@ Some (%varExpr).JsonValue @>, <@ Some (%varExpr).JsonValue @>)
+          typeof<JsonRuntime>?GetNonOptionalValue (field.RuntimeType) (<@ (%varExpr).Path() @>, convert <@ Some (%varExpr).JsonValue @>, <@ Some (%varExpr).JsonValue @>)
     | TypeWrapper.Option, true ->
         convert <@ (%%value:JsonValue option) @>
     | TypeWrapper.Option, false ->
@@ -73,7 +73,6 @@ let convertJsonValue (replacer:AssemblyReplacer) missingValuesStr cultureStr can
     | TypeWrapper.Nullable, false -> 
         //TODO: not covered in tests
         typeof<TextRuntime>?OptionToNullable (field.RuntimeType) (convert <@ Some (%%value:IJsonDocument).JsonValue @>)
-    |> replacer.ToRuntime
 
   let conversionCallingType =
     if canPassAllConversionCallingTypes then

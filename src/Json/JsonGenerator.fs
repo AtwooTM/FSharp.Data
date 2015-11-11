@@ -9,6 +9,7 @@ open System.Reflection
 open Microsoft.FSharp.Quotations
 open FSharp.Data
 open FSharp.Data.Runtime
+open FSharp.Data.Runtime.BaseTypes
 open FSharp.Data.Runtime.StructuralTypes
 open ProviderImplementation
 open ProviderImplementation.JsonInference
@@ -27,44 +28,41 @@ type JsonGenerationContext =
     IJsonDocumentType : Type
     JsonValueType : Type
     JsonRuntimeType : Type
-    // the type that is used to represent documents (JsonDocument or ApiaryDocument)
-    Representation : Type
-    TypeCache : Dictionary<InferedType, ProvidedTypeDefinition> }
+    TypeCache : Dictionary<InferedType, ProvidedTypeDefinition>
+    GenerateConstructors : bool }
   static member Create(cultureStr, tpType, replacer, ?uniqueNiceName, ?typeCache) =
     let uniqueNiceName = defaultArg uniqueNiceName (NameUtils.uniqueGenerator NameUtils.nicePascalName)
     let typeCache = defaultArg typeCache (Dictionary())
-    JsonGenerationContext.Create(cultureStr, tpType, typeof<JsonDocument>, replacer, uniqueNiceName, typeCache)
-  static member Create(cultureStr, tpType, representation, replacer, uniqueNiceName, typeCache) =
+    JsonGenerationContext.Create(cultureStr, tpType, replacer, uniqueNiceName, typeCache, true)
+  static member Create(cultureStr, tpType, replacer, uniqueNiceName, typeCache, generateConstructors) =
     { CultureStr = cultureStr
       TypeProviderType = tpType
       Replacer = replacer 
       UniqueNiceName = uniqueNiceName 
-      IJsonDocumentType = replacer.ToRuntime typeof<IJsonDocument>
-      JsonValueType = replacer.ToRuntime typeof<JsonValue>
-      JsonRuntimeType = replacer.ToRuntime typeof<JsonRuntime>
-      Representation = replacer.ToRuntime representation
-      TypeCache = typeCache }
+      IJsonDocumentType = typeof<IJsonDocument>
+      JsonValueType = typeof<JsonValue>
+      JsonRuntimeType = typeof<JsonRuntime>
+      TypeCache = typeCache 
+      GenerateConstructors = generateConstructors }
   member x.MakeOptionType(typ:Type) = 
-    (x.Replacer.ToRuntime typedefof<option<_>>).MakeGenericType typ
+    typedefof<option<_>>.MakeGenericType typ
 
 type JsonGenerationResult = 
     { ConvertedType : Type
-      Converter : (Expr -> Expr) option
+      OptionalConverter : (Expr -> Expr) option
       ConversionCallingType : JsonConversionCallingType }
-    member x.GetConverter ctx = 
-        defaultArg x.Converter ctx.Replacer.ToRuntime
+    member x.Convert = 
+        defaultArg x.OptionalConverter id
     member x.ConverterFunc ctx =
-      ReflectionHelpers.makeDelegate (x.GetConverter ctx) ctx.IJsonDocumentType
+      ReflectionHelpers.makeDelegate x.Convert ctx.IJsonDocumentType
     member x.ConvertedTypeErased ctx =
       if x.ConvertedType.IsArray then
         match x.ConvertedType.GetElementType() with
         | :? ProvidedTypeDefinition -> ctx.IJsonDocumentType.MakeArrayType()
-        | x when x = ctx.Representation -> ctx.IJsonDocumentType.MakeArrayType()
         | _ -> x.ConvertedType
       else
         match x.ConvertedType with
-        | :? ProvidedTypeDefinition -> ctx.IJsonDocumentType
-        | x when x = ctx.Representation -> ctx.IJsonDocumentType
+        | :? ProvidedTypeDefinition -> ctx.IJsonDocumentType 
         | _ -> x.ConvertedType
 
 module JsonTypeBuilder = 
@@ -80,10 +78,8 @@ module JsonTypeBuilder =
         map 
         |> Map.map (fun _ inferedType -> normalize false inferedType) 
         |> InferedType.Heterogeneous
-    | InferedType.Collection map -> 
-        map 
-        |> Map.map (fun _ (multiplicity, inferedType) -> multiplicity, normalize false inferedType) 
-        |> InferedType.Collection
+    | InferedType.Collection (order, types) -> 
+        InferedType.Collection (order, Map.map (fun _ (multiplicity, inferedType) -> multiplicity, normalize false inferedType) types)
     | InferedType.Record (_, props, optional) -> 
         let props = 
           props
@@ -104,7 +100,7 @@ module JsonTypeBuilder =
         typ
 
     { ConvertedType = typ
-      Converter = None
+      OptionalConverter = None
       ConversionCallingType = JsonDocument }
 
   let replaceJDocWithJValue (ctx:JsonGenerationContext) (typ:Type) = 
@@ -121,7 +117,7 @@ module JsonTypeBuilder =
   /// "Choice" type. This is parameterized by the types (choices) to generate,
   /// by functions that get the multiplicity and the type tag for each option
   /// and also by function that generates the actual code.
-  let rec internal generateMultipleChoiceType ctx types forCollection nameOverride codeGenerator =
+  let rec internal generateMultipleChoiceType ctx types forCollection nameOverride (codeGenerator : _ -> _ -> _ -> _ -> Expr) =
 
     let types = 
       types
@@ -160,8 +156,9 @@ module JsonTypeBuilder =
             |> String.concat "Or"
         |> ctx.UniqueNiceName
 
+    let replacer = ctx.Replacer
     // Generate new type for the heterogeneous type
-    let objectTy = ProvidedTypeDefinition(typeName, Some(ctx.IJsonDocumentType), HideObjectMethods = true)
+    let objectTy = replacer.ProvidedTypeDefinition(typeName, ctx.IJsonDocumentType, hideObjectMethods = true, nonNullable = true)
     ctx.TypeProviderType.AddMember objectTy
 
     // to nameclash property names
@@ -195,30 +192,40 @@ module JsonTypeBuilder =
                   result.ConvertedType.MakeArrayType(), 
                   (replaceJDocWithJValue ctx result.ConvertedType).MakeArrayType()
 
-          ProvidedProperty(name, typ, GetterCode = codeGenerator multiplicity result tag.Code),
-          ProvidedParameter(NameUtils.niceCamelName name, constructorType) ]
+          replacer.ProvidedProperty(name, typ, getterCode = codeGenerator multiplicity result tag.Code),
+          replacer.ProvidedParameter(NameUtils.niceCamelName name, constructorType) ]
 
     let properties, parameters = List.unzip members
     objectTy.AddMembers properties
 
-    let cultureStr = ctx.CultureStr
+    if ctx.GenerateConstructors then
 
-    if forCollection then
-        let ctor = ProvidedConstructor(parameters, InvokeCode = fun args -> 
-            let elements = Expr.NewArray(typeof<obj>, args |> List.map (fun a -> Expr.Coerce(a, typeof<obj>)))
-            let cultureStr = ctx.CultureStr
-            <@@ JsonRuntime.CreateArray(%%elements, cultureStr) @@>
-            |> ctx.Replacer.ToRuntime)
-        objectTy.AddMember ctor
-    else
-        for param in parameters do
-            let ctor = ProvidedConstructor([param], InvokeCode = fun (Singleton arg) -> 
-                let arg = Expr.Coerce(arg, typeof<obj>)
-                ctx.Replacer.ToRuntime <@@ JsonRuntime.CreateValue((%%arg:obj), cultureStr) @@>)
+        let cultureStr = ctx.CultureStr
+
+        if forCollection then
+            let ctor = replacer.ProvidedConstructor(parameters, invokeCode = fun args -> 
+                let elements = Expr.NewArray(typeof<obj>, args |> List.map (fun a -> Expr.Coerce(a, typeof<obj>)))
+                let cultureStr = ctx.CultureStr
+                <@@ JsonRuntime.CreateArray(%%elements, cultureStr) @@>)
             objectTy.AddMember ctor
+        else
+            for param in parameters do
+                let ctor = 
+                    replacer.ProvidedConstructor([param], invokeCode = fun (Singleton arg) -> 
+                        let arg = Expr.Coerce(arg, typeof<obj>)
+                        <@@ JsonRuntime.CreateValue((%%arg:obj), cultureStr) @@>)
+                objectTy.AddMember ctor
 
-        let defaultCtor = ProvidedConstructor([], InvokeCode = fun _ -> ctx.Replacer.ToRuntime <@@ JsonRuntime.CreateValue(null :> obj, cultureStr) @@>)
-        objectTy.AddMember defaultCtor
+            let defaultCtor = 
+                replacer.ProvidedConstructor([], invokeCode = fun _ -> 
+                    <@@ JsonRuntime.CreateValue(null :> obj, cultureStr) @@>)
+            objectTy.AddMember defaultCtor
+
+        objectTy.AddMember <| 
+            replacer.ProvidedConstructor(
+                [replacer.ProvidedParameter("jsonValue", ctx.JsonValueType)], 
+                invokeCode = fun (Singleton arg) -> 
+                    <@@ JsonDocument.Create((%%arg:JsonValue), "") @@>)
 
     objectTy
 
@@ -226,12 +233,11 @@ module JsonTypeBuilder =
   /// generates types for read-only access to the document
   and generateJsonType ctx canPassAllConversionCallingTypes optionalityHandledByParent nameOverride inferedType =
 
+    let replacer = ctx.Replacer
     let inferedType = 
       match inferedType with
-      | InferedType.Collection types ->
-          types 
-          |> Map.remove InferedTypeTag.Null 
-          |> InferedType.Collection 
+      | InferedType.Collection (order, types) ->
+          InferedType.Collection (List.filter ((<>) InferedTypeTag.Null) order, Map.remove InferedTypeTag.Null types)
       | x -> x
 
     match inferedType with
@@ -240,10 +246,10 @@ module JsonTypeBuilder =
 
         let typ, conv, conversionCallingType = 
             PrimitiveInferedProperty.Create("", inferedType, optional, unit)
-            |> convertJsonValue ctx.Replacer "" ctx.CultureStr canPassAllConversionCallingTypes
+            |> convertJsonValue "" ctx.CultureStr canPassAllConversionCallingTypes
 
         { ConvertedType = typ
-          Converter = Some (ctx.Replacer.ToDesignTime >> conv)
+          OptionalConverter = Some conv
           ConversionCallingType = conversionCallingType }
 
     | InferedType.Top 
@@ -251,19 +257,19 @@ module JsonTypeBuilder =
 
         // Return the underlying JsonDocument without change
         { ConvertedType = ctx.IJsonDocumentType
-          Converter = None
+          OptionalConverter = None
           ConversionCallingType = JsonDocument }
 
-    | InferedType.Collection (SingletonMap(_, (_, typ)))
-    | InferedType.Collection (EmptyMap InferedType.Top typ) -> 
+    | InferedType.Collection (_, SingletonMap(_, (_, typ)))
+    | InferedType.Collection (_, EmptyMap InferedType.Top typ) -> 
 
         let elementResult = generateJsonType ctx (*canPassAllConversionCallingTypes*)false (*optionalityHandledByParent*)false nameOverride typ
 
         let conv = fun (jDoc:Expr) -> 
-          ctx.JsonRuntimeType?ConvertArray (elementResult.ConvertedTypeErased ctx) (ctx.Replacer.ToRuntime jDoc, elementResult.ConverterFunc ctx)
+          ctx.JsonRuntimeType?ConvertArray (elementResult.ConvertedTypeErased ctx) (jDoc, elementResult.ConverterFunc ctx)
         
         { ConvertedType = elementResult.ConvertedType.MakeArrayType()
-          Converter = Some conv
+          OptionalConverter = Some conv
           ConversionCallingType = JsonDocument }
 
     | InferedType.Record(name, props, optional) -> getOrCreateType ctx inferedType <| fun () ->
@@ -278,7 +284,8 @@ module JsonTypeBuilder =
             |> ctx.UniqueNiceName
 
         // Generate new type for the record
-        let objectTy = ProvidedTypeDefinition(name, Some(ctx.IJsonDocumentType), HideObjectMethods = true)
+        let objectTy = replacer.ProvidedTypeDefinition(name, ctx.IJsonDocumentType, hideObjectMethods = true, nonNullable = true)
+
         ctx.TypeProviderType.AddMember(objectTy)
 
         // to nameclash property names
@@ -297,8 +304,7 @@ module JsonTypeBuilder =
 
                 if optionalityHandledByProperty then 
 
-                  let jDoc = ctx.Replacer.ToDesignTime jDoc
-                  propResult.GetConverter ctx <|
+                  propResult.Convert <|
                     if propResult.ConversionCallingType = JsonValueOptionAndPath then
                       <@@ JsonRuntime.TryGetPropertyUnpackedWithPath(%%jDoc, propName) @@>
                     else
@@ -306,19 +312,17 @@ module JsonTypeBuilder =
           
                 elif prop.Type.IsOptional then
               
-                  match propResult.Converter with
+                  match propResult.OptionalConverter with
                   | Some _ ->
                       //TODO: not covered in tests
-                      ctx.JsonRuntimeType?ConvertOptionalProperty (propResult.ConvertedTypeErased ctx) (jDoc, propName, propResult.ConverterFunc ctx) :> Expr
+                      ctx.JsonRuntimeType?ConvertOptionalProperty (propResult.ConvertedTypeErased ctx) (jDoc, propName, propResult.ConverterFunc ctx) 
 
                   | None ->
-                      let jDoc = ctx.Replacer.ToDesignTime jDoc
-                      ctx.Replacer.ToRuntime <@@ JsonRuntime.TryGetPropertyPacked(%%jDoc, propName) @@>
+                      <@@ JsonRuntime.TryGetPropertyPacked(%%jDoc, propName) @@>
           
                 else
 
-                  let jDoc = ctx.Replacer.ToDesignTime jDoc
-                  propResult.GetConverter ctx <|
+                  propResult.Convert <|
                     match prop.Type with
                     | InferedType.Collection _ 
                     | InferedType.Heterogeneous _ 
@@ -333,27 +337,32 @@ module JsonTypeBuilder =
 
               let name = makeUnique prop.Name
               prop.Name,
-              ProvidedProperty(name, convertedType, GetterCode = getter),
-              ProvidedParameter(NameUtils.niceCamelName name, replaceJDocWithJValue ctx convertedType) ]
+              replacer.ProvidedProperty(name, convertedType, getterCode = getter),
+              replacer.ProvidedParameter(NameUtils.niceCamelName name, replaceJDocWithJValue ctx convertedType) ]
 
         let names, properties, parameters = List.unzip3 members
         objectTy.AddMembers properties
 
-        let ctor = ProvidedConstructor(parameters, InvokeCode = fun args -> 
-            let properties = 
-                Expr.NewArray(typeof<string * obj>, 
-                              args 
-                              |> List.mapi (fun i a -> Expr.NewTuple [ Expr.Value names.[i]
-                                                                       Expr.Coerce(a, typeof<obj>) ]))
-            let cultureStr = ctx.CultureStr
-            <@@ JsonRuntime.CreateRecord(%%properties, cultureStr) @@>
-            |> ctx.Replacer.ToRuntime)
+        if ctx.GenerateConstructors then
 
-        objectTy.AddMember ctor
+            objectTy.AddMember <| 
+                replacer.ProvidedConstructor(parameters, invokeCode = fun args -> 
+                    let properties = 
+                        Expr.NewArray(typeof<string * obj>, 
+                                      args 
+                                      |> List.mapi (fun i a -> Expr.NewTuple [ Expr.Value names.[i]; Expr.Coerce(a, typeof<obj>) ]))
+                    let cultureStr = ctx.CultureStr
+                    <@@ JsonRuntime.CreateRecord(%%properties, cultureStr) @@>)
+
+            objectTy.AddMember <| 
+                    replacer.ProvidedConstructor(
+                        [replacer.ProvidedParameter("jsonValue", ctx.JsonValueType)], 
+                        invokeCode = fun (Singleton arg) -> 
+                            <@@ JsonDocument.Create((%%arg:JsonValue), "") @@> )
 
         objectTy
 
-    | InferedType.Collection types -> getOrCreateType ctx inferedType <| fun () ->
+    | InferedType.Collection (_, types) -> getOrCreateType ctx inferedType <| fun () ->
 
         // Generate a choice type that calls either `GetArrayChildrenByTypeTag`
         // or `GetArrayChildByTypeTag`, depending on the multiplicity of the item
@@ -361,9 +370,8 @@ module JsonTypeBuilder =
           match multiplicity with
           | InferedMultiplicity.Single -> fun (Singleton jDoc) -> 
               // Generate method that calls `GetArrayChildByTypeTag`
-              let jDoc = ctx.Replacer.ToDesignTime jDoc
               let cultureStr = ctx.CultureStr
-              result.GetConverter ctx <@@ JsonRuntime.GetArrayChildByTypeTag(%%jDoc, cultureStr, tagCode) @@>
+              result.Convert  <@@ JsonRuntime.GetArrayChildByTypeTag(%%jDoc, cultureStr, tagCode) @@>
           
           | InferedMultiplicity.Multiple -> fun (Singleton jDoc) -> 
               // Generate method that calls `GetArrayChildrenByTypeTag` 

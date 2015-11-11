@@ -4,19 +4,23 @@
 namespace FSharp.Data
 
 open System.Xml.Linq
+open System.Runtime.InteropServices
 
+// XElementExtensions is not a static class with C#-style extension methods because that would
+// force to reference System.Xml.Linq.dll everytime you reference FSharp.Data, even when not using
+// any of the XML parts
 [<AutoOpen>]
-/// Extension methods for XElement. It is auto opened.
+/// Extension methods for XElement
 module XElementExtensions = 
 
     type XElement with
 
       /// Sends the XML to the specified uri. Defaults to a POST request.
-      member x.Request(uri:string, ?httpMethod, ?headers) =  
-        let httpMethod = defaultArg httpMethod HttpMethod.Post
-        let headers = defaultArg headers []
+      member x.Request(uri:string, [<Optional>] ?httpMethod, [<Optional>] ?headers:seq<_>) =  
+        let httpMethod = defaultArg httpMethod HttpMethod.Post  
+        let headers = defaultArg (Option.map List.ofSeq headers) []
         let headers =
-            if headers |> List.exists (fst >> ((=) (fst (HttpRequestHeaders.UserAgent ""))))
+            if headers |> List.exists (fst >> (=) (fst (HttpRequestHeaders.UserAgent "")))
             then headers
             else HttpRequestHeaders.UserAgent "F# Data XML Type Provider" :: headers
         let headers = HttpRequestHeaders.ContentType HttpContentTypes.Xml :: headers
@@ -27,11 +31,11 @@ module XElementExtensions =
           httpMethod = httpMethod)
 
       /// Sends the XML to the specified uri. Defaults to a POST request.
-      member x.RequestAsync(uri:string, ?httpMethod, ?headers) =
+      member x.RequestAsync(uri:string, [<Optional>] ?httpMethod, [<Optional>] ?headers:seq<_>) =
         let httpMethod = defaultArg httpMethod HttpMethod.Post
-        let headers = defaultArg headers []
+        let headers = defaultArg (Option.map List.ofSeq headers) []
         let headers =
-            if headers |> List.exists (fst >> ((=) (fst (HttpRequestHeaders.UserAgent ""))))
+            if headers |> List.exists (fst >> (=) (fst (HttpRequestHeaders.UserAgent "")))
             then headers
             else HttpRequestHeaders.UserAgent "F# Data XML Type Provider" :: headers
         let headers = HttpRequestHeaders.ContentType HttpContentTypes.Xml :: headers
@@ -41,12 +45,13 @@ module XElementExtensions =
           headers = headers,
           httpMethod = httpMethod)
 
-namespace FSharp.Data.Runtime
+// --------------------------------------------------------------------------------------
+
+namespace FSharp.Data.Runtime.BaseTypes
 
 open System
 open System.ComponentModel
 open System.IO
-open System.Globalization
 open System.Xml.Linq
 
 #nowarn "10001"
@@ -63,6 +68,11 @@ type XmlElement =
   [<EditorBrowsableAttribute(EditorBrowsableState.Never)>]
   [<CompilerMessageAttribute("This method is intended for use in generated code only.", 10001, IsHidden=true, IsError=false)>]
   member x._Print = x.XElement.ToString()
+
+  /// [omit]
+  [<EditorBrowsableAttribute(EditorBrowsableState.Never)>]
+  [<CompilerMessageAttribute("This method is intended for use in generated code only.", 10001, IsHidden=true, IsError=false)>]
+  override x.ToString() = x._Print
 
   /// [omit]
   [<EditorBrowsableAttribute(EditorBrowsableState.Never)>]
@@ -94,11 +104,20 @@ type XmlElement =
       |> Seq.map (fun value -> { XElement = value })
       |> Seq.toArray
 
+// --------------------------------------------------------------------------------------
+
+namespace FSharp.Data.Runtime
+
+open System
+open System.IO
+open System.Xml.Linq
+open FSharp.Data.Runtime.BaseTypes
+
 /// Static helper methods called from the generated code for working with XML
 type XmlRuntime = 
 
   // Operations for getting node values and values of attributes
-
+    
   static member TryGetValue(xml:XmlElement) = 
     if String.IsNullOrEmpty(xml.XElement.Value) then None else Some xml.XElement.Value
 
@@ -111,7 +130,7 @@ type XmlRuntime =
   // just the value (if we think it is always there)
 
   static member private GetChildrenArray(value:XmlElement, nameWithNS:string) =
-    let namesWithNS = nameWithNS.Split [| '|' |]
+    let namesWithNS = nameWithNS.Split '|'
     let mutable current = value.XElement
     for i = 0 to namesWithNS.Length - 2 do
         if current <> null then
@@ -165,3 +184,106 @@ type XmlRuntime =
             JsonDocument.Create(new StringReader(jsonStr), cultureStr) |> Some
         with _ -> None
     | None -> None
+
+  /// Creates a XElement with a scalar value and wraps it in a XmlElement
+  static member CreateValue(nameWithNS, value:obj, cultureStr) = 
+    XmlRuntime.CreateRecord(nameWithNS, [| |], [| "", value |], cultureStr)
+
+  // Creates a XElement with the given attributes and elements and wraps it in a XmlElement
+  static member CreateRecord(nameWithNS, attributes:_[], elements:_[], cultureStr) =
+    let cultureInfo = TextRuntime.GetCulture cultureStr
+    let toXmlContent (v:obj) = 
+        let inline strWithCulture v =
+            (^a : (member ToString : IFormatProvider -> string) (v, cultureInfo)) 
+        let serialize (v:obj) =
+            match v with
+            | :? XmlElement as v -> box v.XElement
+            | _ ->
+                match v with
+                | :? string        as v -> v
+                | :? DateTime      as v -> v.ToString("O", cultureInfo)
+                | :? int           as v -> strWithCulture v
+                | :? int64         as v -> strWithCulture v
+                | :? float         as v -> strWithCulture v
+                | :? decimal       as v -> strWithCulture v
+                | :? bool          as v -> if v then "true" else "false"
+                | :? Guid          as v -> v.ToString()
+                | :? IJsonDocument as v -> v.JsonValue.ToString()
+                | _ -> failwithf "Unexpected value: %A" v
+                |> box
+        let inline optionToArray f = function Some x -> [| f x |] | None -> [| |]
+        match v with
+        | :? Array as v -> [| for elem in v -> serialize elem |]
+        | :? option<XmlElement>    as v -> optionToArray serialize v
+        | :? option<string>        as v -> optionToArray serialize v
+        | :? option<DateTime>      as v -> optionToArray serialize v
+        | :? option<int>           as v -> optionToArray serialize v
+        | :? option<int64>         as v -> optionToArray serialize v
+        | :? option<float>         as v -> optionToArray serialize v
+        | :? option<decimal>       as v -> optionToArray serialize v
+        | :? option<bool>          as v -> optionToArray serialize v
+        | :? option<Guid>          as v -> optionToArray serialize v
+        | :? option<IJsonDocument> as v -> optionToArray serialize v
+        | v -> [| box (serialize v) |]
+    let createElement (parent:XElement) (nameWithNS:string) =
+        let namesWithNS = nameWithNS.Split '|'
+        (parent, namesWithNS)
+        ||> Array.fold (fun parent nameWithNS ->
+            let xname = XName.Get nameWithNS
+            if parent = null then
+                XElement xname
+            else
+                let element = if nameWithNS = Seq.last namesWithNS
+                              then null 
+                              else parent.Element(xname) 
+                if element = null then
+                    let element = XElement xname
+                    parent.Add element
+                    element
+                else
+                    element)
+    let element = createElement null nameWithNS
+    for nameWithNS, value in attributes do
+        let xname = XName.Get nameWithNS
+        match toXmlContent value with
+        | [| |] -> ()
+        | [| v |] when v :? string && element.Attribute(xname) = null -> element.SetAttributeValue(xname, v)
+        | _ -> failwithf "Unexpected attribute value: %A" value
+    let parents = System.Collections.Generic.Dictionary()
+    for nameWithNS, value in elements do
+        if nameWithNS = "" then // it's the value
+            match toXmlContent value with
+            | [| |] -> ()
+            | [| v |] when v :? string && element.Value = "" -> element.Add v
+            | _ -> failwithf "Unexpected content value: %A" value
+        else
+            for value in toXmlContent value do
+                match value with
+                | :? XElement as v -> 
+                    let parentNames = nameWithNS.Split('|') |> Array.rev
+                    if v.Name.ToString() <> parentNames.[0] then
+                        failwithf "Unexpected element: %O" v
+                    let v = 
+                        (v, Seq.skip 1 parentNames |> Seq.mapi (fun x i -> x, i))
+                        ||> Seq.fold (fun element ((_, nameWithNS) as key) -> 
+                            if element.Parent = null then 
+                                let parent = 
+                                    match parents.TryGetValue key with
+                                    | true, parent -> parent
+                                    | false, _ -> 
+                                        let parent = createElement null nameWithNS 
+                                        parents.Add(key, parent)
+                                        parent
+                                parent.Add element
+                                parent
+                            else 
+                                if element.Parent.Name.ToString() <> nameWithNS then
+                                    failwithf "Unexpected element: %O" v
+                                element.Parent)
+                    if v.Parent = null then
+                        element.Add v
+                | :? string as v -> 
+                    let child = createElement element nameWithNS 
+                    child.Value <- v
+                | _ -> failwithf "Unexpected content for child %s: %A" nameWithNS value
+    XmlElement.Create element

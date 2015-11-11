@@ -1,5 +1,5 @@
 ﻿#r "bin/FSharp.Data.dll"
-#load "packages/FSharp.Charting.0.90.5/FSharp.Charting.fsx"
+#load "packages/FSharp.Charting/FSharp.Charting.fsx"
 
 open FSharp.Data
 open FSharp.Charting
